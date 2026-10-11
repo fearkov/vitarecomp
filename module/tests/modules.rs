@@ -310,3 +310,28 @@ fn a_fixed_module_stays_where_it_was_linked() {
     assert!(module.relocated(&[TEXT, DATA]).is_ok());
     assert!(matches!(module.relocated(&[0x9000_0000, DATA]), Err(Error::Fixed)));
 }
+
+#[test]
+fn a_placed_module_gives_addresses_where_it_was_loaded() {
+    let module = fixture("tiny.velf");
+    const SHIFT: u32 = 0x0F00_0000;
+    let bases: Vec<u32> = module.segments.iter().map(|segment| segment.address.wrapping_add(SHIFT)).collect();
+    let placed = module.placed(&bases).unwrap();
+    assert_eq!(placed.start(), Some(0x8100_0001 + SHIFT));
+    for (segment, base) in placed.segments.iter().zip(&bases).filter(|(segment, _)| segment.is_load()) {
+        assert_eq!(segment.address, *base);
+        assert_eq!(segment.bytes.len(), segment.memory_size as usize);
+    }
+    let stubs = |module: &Module| -> Vec<u32> {
+        module.imports.iter().flat_map(|import| import.functions.iter().map(|function| function.stub)).collect()
+    };
+    let moved: Vec<u32> = stubs(&module).iter().map(|stub| stub + SHIFT).collect();
+    assert_eq!(stubs(&placed), moved);
+    for function in placed.imports.iter().flat_map(|import| &import.functions) {
+        assert_eq!(placed.bytes(function.stub, 12), Some(&words(&testing::THUNK)[..]));
+    }
+    assert_eq!(
+        placed.process_param().map(|param| param.sdk_version),
+        module.process_param().map(|param| param.sdk_version)
+    );
+}

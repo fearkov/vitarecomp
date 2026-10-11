@@ -155,11 +155,8 @@ impl Module {
             return Err(Error::NotVita(header.kind, header.machine));
         }
         let info = Info::read(&segments, header.entry)?;
-        // the vitasdk's own modules: its SELFs, and its ELFs, which have no
-        // fingerprint until vita-make-fself puts one in
-        let vitasdk = container.is_homebrew() || (container == Container::Elf && info.fingerprint == 0);
         let exports = info::exports(&segments, &info)?;
-        let imports = info::imports(&segments, &info, vitasdk)?;
+        let imports = info::imports(&segments, &info, made_by_vitasdk(container, &info))?;
         let mut relocation_formats = [0; 10];
         let mut relocations = Vec::new();
         for segment in segments.iter().filter(|segment| segment.kind == PT_SCE_RELA) {
@@ -269,6 +266,49 @@ impl Module {
         }
         Ok(images)
     }
+
+    /// the module as it is once loaded at bases, which hold a base for each
+    /// segment by index as for [Module::relocated]: its loadable segments
+    /// there, relocated and as long as their memory size, and its tables
+    /// read again from them, so that every address it gives is one in
+    /// memory. the system reads the tables only once it has relocated them,
+    /// so a module's file need not hold the addresses it was linked with
+    /// where a relocation fills them in.
+    pub fn placed(&self, bases: &[u32]) -> Result<Module, Error> {
+        let images = self.relocated(bases)?;
+        let segments: Vec<Segment> = self
+            .segments
+            .iter()
+            .zip(images)
+            .zip(bases)
+            .map(|((segment, image), &base)| {
+                let (address, bytes) =
+                    if segment.is_load() { (base, image) } else { (segment.address, segment.bytes.clone()) };
+                Segment { address, bytes, ..*segment }
+            })
+            .collect();
+        let info = Info::read(&segments, self.entry)?;
+        let exports = info::exports(&segments, &info)?;
+        let imports = info::imports(&segments, &info, made_by_vitasdk(self.container, &info))?;
+        Ok(Module {
+            container: self.container,
+            kind: self.kind,
+            flags: self.flags,
+            entry: self.entry,
+            segments,
+            info,
+            exports,
+            imports,
+            relocations: self.relocations.clone(),
+            relocation_formats: self.relocation_formats,
+        })
+    }
+}
+
+/// whether the vitasdk made a module: its SELFs, and its ELFs, which have no
+/// fingerprint until vita-make-fself puts one in.
+fn made_by_vitasdk(container: Container, info: &Info) -> bool {
+    container.is_homebrew() || (container == Container::Elf && info.fingerprint == 0)
 }
 
 /// the loadable segment an address falls in, and how far into it.
