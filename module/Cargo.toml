@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 rust-version = "1.95"
 license = "MIT"
-description = "Reading the PlayStation Vita's executables and modules: SELF and ELF files, their imports, exports and relocations"
+description = "A reader for the PlayStation Vita's executables and modules, SELF and ELF files with their imports, exports and relocations, and the games they come in"
 
 [features]
 # builders of modules, for the tests of the crates that read them

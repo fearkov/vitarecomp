@@ -30,6 +30,9 @@ pub struct LibraryImport {
     /// each variable's NID and the references to it in its reftable, which
     /// the module takes in the long form when an addend needs a whole word.
     pub variables: Vec<(u32, Vec<crate::Reference>)>,
+    /// the thread local variables likewise, in tables of their own in the
+    /// 0x34 layout and after the other variables in the 0x24 one.
+    pub tls: Vec<(u32, Vec<crate::Reference>)>,
     /// the 0x34 byte layout with TLS tables rather than the 0x24 one.
     pub long: bool,
 }
@@ -37,6 +40,11 @@ pub struct LibraryImport {
 /// a module to build, its code and data where TEXT and DATA say.
 pub struct ModuleBuilder {
     pub name: String,
+    /// major and minor.
+    pub version: (u8, u8),
+    /// zero as vita-elf-create leaves it, a hash once vita-make-fself or
+    /// Sony's tools put one in.
+    pub fingerprint: u32,
     pub kind: u16,
     pub code: Vec<u8>,
     pub data: Vec<u8>,
@@ -47,16 +55,22 @@ pub struct ModuleBuilder {
     pub imports: Vec<LibraryImport>,
     /// a PT_SCE_RELA table as it is in the file, none when empty.
     pub relocations: Vec<u8>,
-    /// whether it is an executable and carries SceProcessParam, with these
-    /// main thread priority and stack size variables.
+    /// the main thread priority and stack size of the SceProcessParam an
+    /// executable carries, none for a module without one.
     pub process: Option<(u32, u32)>,
+    /// whether long references put the addend before the offset, as the
+    /// wiki has them, rather than after it as the vitasdk writes them.
+    pub addend_first: bool,
 }
 
 impl Default for ModuleBuilder {
     fn default() -> Self {
         ModuleBuilder {
             name: "test".to_owned(),
+            version: (1, 1),
+            fingerprint: 0,
             kind: ET_SCE_RELEXEC,
+            // bx lr, in Thumb
             code: vec![0x70, 0x47],
             data: Vec::new(),
             bss: 0,
@@ -65,6 +79,7 @@ impl Default for ModuleBuilder {
             imports: Vec::new(),
             relocations: Vec::new(),
             process: None,
+            addend_first: false,
         }
     }
 }
@@ -172,24 +187,44 @@ impl ModuleBuilder {
                 .collect();
             let function_nids = text.words(&import.functions);
             let stub_table = text.words(&stubs);
-            let tables: Vec<u32> =
-                import.variables.iter().map(|(_, references)| reftable(&mut text, references)).collect();
-            let variable_nids = text.words(&import.variables.iter().map(|&(nid, _)| nid).collect::<Vec<_>>());
-            let variable_table = text.words(&tables);
+            // the 0x24 layout keeps the TLS variables after the others
+            let mut variables: Vec<_> = import.variables.iter().collect();
+            if !import.long {
+                variables.extend(&import.tls);
+            }
+            let mut table = |variables: &[&(u32, Vec<crate::Reference>)]| {
+                let tables: Vec<u32> = variables
+                    .iter()
+                    .map(|(_, references)| reftable(&mut text, references, self.addend_first))
+                    .collect();
+                let nids = text.words(&variables.iter().map(|&&(nid, _)| nid).collect::<Vec<_>>());
+                (nids, text.words(&tables))
+            };
+            let (variable_nids, variable_table) = table(&variables);
+            let tls: Vec<_> = import.tls.iter().collect();
+            let (tls_nids, tls_table) = if import.long { table(&tls) } else { (0, 0) };
             let name = text.text(&import.name);
-            import_entries.push((import, name, function_nids, stub_table, variable_nids, variable_table));
+            import_entries.push((
+                import,
+                name,
+                [function_nids, stub_table, variable_nids, variable_table, tls_nids, tls_table],
+            ));
         }
         let imports_top = text.here();
-        for (import, name, function_nids, stub_table, variable_nids, variable_table) in import_entries {
+        for (import, name, [function_nids, stub_table, variable_nids, variable_table, tls_nids, tls_table]) in
+            import_entries
+        {
             let size: u8 = if import.long { 0x34 } else { 0x24 };
             text.bytes.extend_from_slice(&[size, 0]);
             text.bytes.extend_from_slice(&1u16.to_le_bytes());
             text.bytes.extend_from_slice(&0x0008u16.to_le_bytes());
             text.bytes.extend_from_slice(&(import.functions.len() as u16).to_le_bytes());
             text.bytes.extend_from_slice(&(import.variables.len() as u16).to_le_bytes());
-            text.bytes.extend_from_slice(&0u16.to_le_bytes());
+            text.bytes.extend_from_slice(&(import.tls.len() as u16).to_le_bytes());
             if import.long {
-                text.words(&[0, import.nid, name, 0, function_nids, stub_table, variable_nids, variable_table, 0, 0]);
+                let tables = [function_nids, stub_table, variable_nids, variable_table, tls_nids, tls_table];
+                text.words(&[0, import.nid, name, 0]);
+                text.words(&tables);
             } else {
                 text.words(&[import.nid, name, function_nids, stub_table, variable_nids, variable_table]);
             }
@@ -200,7 +235,9 @@ impl ModuleBuilder {
         let offset = |address: u32| address - TEXT;
         let mut info = Vec::with_capacity(0x5C);
         info.extend_from_slice(&0u16.to_le_bytes());
-        info.extend_from_slice(&[1, 1]);
+        // the version as a halfword, the major on top
+        let (major, minor) = self.version;
+        info.extend_from_slice(&((major as u16) << 8 | minor as u16).to_le_bytes());
         let mut name = [0u8; 27];
         name[..self.name.len().min(26)].copy_from_slice(&self.name.as_bytes()[..self.name.len().min(26)]);
         info.extend_from_slice(&name);
@@ -211,7 +248,7 @@ impl ModuleBuilder {
             offset(exports_end),
             offset(imports_top),
             offset(imports_end),
-            0x1234_5678,
+            self.fingerprint,
             0,
             0,
             0,
@@ -238,14 +275,17 @@ impl ModuleBuilder {
     }
 }
 
-/// a reftable with the references given, at the text's end.
-fn reftable(text: &mut Text, references: &[crate::Reference]) -> u32 {
+/// a reftable with the references given, at the text's end, the long ones
+/// with the addend first or last.
+fn reftable(text: &mut Text, references: &[crate::Reference], addend_first: bool) -> u32 {
     let mut entries = Vec::new();
     for reference in references {
         let first = |form: u32| form | (reference.segment as u32) << 4 | (reference.kind as u32) << 8;
         if reference.addend as i16 as i32 == reference.addend {
             entries.push(first(1) | (reference.addend as u16 as u32) << 16);
             entries.push(reference.offset);
+        } else if addend_first {
+            entries.extend([first(2), reference.addend as u32, reference.offset]);
         } else {
             entries.extend([first(2), reference.offset, reference.addend as u32]);
         }
@@ -295,7 +335,8 @@ pub fn elf(kind: u16, entry: u32, segments: &[(u32, u32, u32, Vec<u8>, u32)]) ->
 }
 
 /// an ELF wrapped in a SELF the way vita-make-fself does, its segments
-/// compressed or not, or marked encrypted for tests of what happens then.
+/// compressed or not and padded to a whole word, or marked encrypted for
+/// tests of what happens then.
 pub fn self_file(elf: &[u8], compress: bool, encrypted: bool) -> Vec<u8> {
     let header = crate::elf::header(elf).expect("an ELF");
     let count = header.program_header_count as usize;
@@ -320,9 +361,10 @@ pub fn self_file(elf: &[u8], compress: bool, encrypted: bool) -> Vec<u8> {
     out[0x8C..0x90].copy_from_slice(&8u32.to_le_bytes());
     out[0xA0..0xD4].copy_from_slice(&elf[..0x34]);
     out[0xE0..0xE0 + 0x20 * count].copy_from_slice(&elf[header.program_headers as usize..][..0x20 * count]);
-    for (index, ph) in headers.iter().enumerate() {
-        let bytes = &elf[ph.offset as usize..(ph.offset + ph.file_size) as usize];
-        let stored = if compress { miniz_oxide::deflate::compress_to_vec_zlib(bytes, 6) } else { bytes.to_vec() };
+    for (index, header) in headers.iter().enumerate() {
+        let bytes = &elf[header.offset as usize..(header.offset + header.file_size) as usize];
+        let mut stored = if compress { miniz_oxide::deflate::compress_to_vec_zlib(bytes, 6) } else { bytes.to_vec() };
+        stored.resize(stored.len().next_multiple_of(4), 0);
         let offset = out.len() as u64;
         out.extend_from_slice(&stored);
         let info = segment_info + index * 0x20;

@@ -1,5 +1,5 @@
 //! the ELF inside every Vita executable and module, its header and its
-//! program headers. sections don't matter, the system loads segments.
+//! program headers. sections do not matter, the system loads segments.
 
 use crate::read::{u16_at, u32_at};
 

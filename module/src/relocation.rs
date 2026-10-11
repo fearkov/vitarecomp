@@ -18,10 +18,10 @@ pub const R_ARM_REL32: u8 = 3;
 pub const R_ARM_THM_CALL: u8 = 10;
 pub const R_ARM_CALL: u8 = 28;
 pub const R_ARM_JUMP24: u8 = 29;
-/// what ABS32 is on the Vita.
+/// the same as ABS32, on the Vita.
 pub const R_ARM_TARGET1: u8 = 38;
 pub const R_ARM_V4BX: u8 = 40;
-/// what REL32 is on the Vita.
+/// the same as REL32, on the Vita.
 pub const R_ARM_TARGET2: u8 = 41;
 pub const R_ARM_PREL31: u8 = 42;
 pub const R_ARM_MOVW_ABS_NC: u8 = 43;
@@ -47,7 +47,9 @@ pub struct Relocation {
 }
 
 impl Relocation {
-    /// the address it refers to once the symbol's segment is at base.
+    /// S + A, the symbol's address once its segment is at base plus the
+    /// addend, which is what patch() takes. a branch goes 4 bytes past it in
+    /// Thumb and 8 in ARM, as its addend takes away the pc's lead.
     pub fn target(&self, base: u32) -> u32 {
         base.wrapping_add(self.addend)
     }
@@ -202,10 +204,27 @@ pub fn decode(table: &[u8], segments: &[Segment], formats: &mut [usize; 10]) -> 
         formats[format as usize] += 1;
         at += size;
     }
-    // a damaged table could name segments the module doesn't have
-    let exists = |segment: u8| (segment as usize) < segments.len();
-    if !found.iter().all(|relocation| exists(relocation.segment) && relocation.symbol.is_none_or(exists)) {
-        return Err(Error::Malformed("relocation naming a segment the module doesn't have"));
+    // a damaged table could name segments the module does not load, or
+    // places outside them
+    let loaded = |segment: u8| segments.get(segment as usize).is_some_and(Segment::is_load);
+    for relocation in &mut found {
+        if !loaded(relocation.segment) || !relocation.symbol.is_none_or(loaded) {
+            return Err(Error::Malformed("a relocation naming a segment the module does not load"));
+        }
+        let segment = &segments[relocation.segment as usize];
+        if relocation.offset.checked_add(4).is_none_or(|end| end > segment.size()) {
+            return Err(Error::Malformed("a relocation outside its segment"));
+        }
+        if relocation.kind == R_ARM_PREL31 {
+            // the vitasdk takes a PREL31's 31 bits without their sign, so its
+            // addend can be 2^31 off; the offset the place holds, from the
+            // addresses the module was linked at, sets it right
+            let place = segment.address.wrapping_add(relocation.offset);
+            let symbol = relocation.symbol.map_or(0, |symbol| segments[symbol as usize].address);
+            let field = symbol.wrapping_add(relocation.addend).wrapping_sub(place) & 0x7FFF_FFFF;
+            let offset = ((field << 1) as i32 >> 1) as u32;
+            relocation.addend = place.wrapping_add(offset).wrapping_sub(symbol);
+        }
     }
     Ok(found)
 }
@@ -259,8 +278,10 @@ pub fn patches_code(kind: u8) -> bool {
 pub fn fits(kind: u8, word: u32) -> bool {
     let (first, second) = (word & 0xFFFF, word >> 16);
     match kind {
-        // bl, blx or b.w, which takes the same offset
-        R_ARM_THM_CALL => first & 0xF800 == 0xF000 && second & 0x8000 != 0,
+        // bl, b.w, which takes the same offset, or blx with an even one
+        R_ARM_THM_CALL => {
+            first & 0xF800 == 0xF000 && (matches!(second & 0xD000, 0xD000 | 0x9000) || second & 0xD001 == 0xC000)
+        }
         // b or bl, possibly conditional, or blx with an immediate
         R_ARM_CALL | R_ARM_JUMP24 => (word >> 25) & 7 == 0b101,
         R_ARM_MOVW_ABS_NC => word & 0x0FF0_0000 == 0x0300_0000,
@@ -272,8 +293,8 @@ pub fn fits(kind: u8, word: u32) -> bool {
 }
 
 /// the word at a relocation's place once it refers to target, the symbol's
-/// address plus the addend, with place where the word now is. none for a
-/// kind the Vita doesn't have.
+/// address plus the addend, place being where the word is now. none for a
+/// kind the Vita does not have.
 pub fn patch(kind: u8, word: u32, place: u32, target: u32) -> Option<u32> {
     let relative = target.wrapping_sub(place);
     Some(match kind {
@@ -281,10 +302,9 @@ pub fn patch(kind: u8, word: u32, place: u32, target: u32) -> Option<u32> {
         R_ARM_REL32 | R_ARM_TARGET2 => relative,
         R_ARM_PREL31 => word & 0x8000_0000 | relative & 0x7FFF_FFFF,
         R_ARM_THM_CALL => thumb_branch(word, relative),
-        // blx with an immediate keeps the halfword bit of the offset in H
-        R_ARM_CALL | R_ARM_JUMP24 if word >> 28 == 0xF => {
-            word & 0xFE00_0000 | (relative >> 1 & 1) << 24 | (relative >> 2) & 0x00FF_FFFF
-        }
+        // the top byte stays, and with it a blx's H bit, the halfword of its
+        // offset, which segments moved by whole words never change. the
+        // vitasdk's addends leave it out
         R_ARM_CALL | R_ARM_JUMP24 => word & 0xFF00_0000 | (relative >> 2) & 0x00FF_FFFF,
         R_ARM_MOVW_ABS_NC => arm_move(word, target & 0xFFFF),
         R_ARM_MOVT_ABS => arm_move(word, target >> 16),
@@ -410,7 +430,42 @@ mod tests {
         assert_eq!(bl, 0xFF7E_F7FF);
         assert!(fits(R_ARM_THM_CALL, bl));
 
-        // arm movw r1, #0
+        // movw r1, #0 in ARM
         assert_eq!(patch(R_ARM_MOVW_ABS_NC, 0xE300_1000, 0, 0xABCD).unwrap(), 0xE30A_1BCD);
+
+        // a blx from 0x8100021C to Thumb at 0x8100023A, its H bit set, as
+        // the vitasdk relocates it: an addend without the halfword
+        let blx = 0xFB00_0005;
+        assert_eq!(patch(R_ARM_CALL, blx, 0x8100_021C, 0x8100_0230).unwrap(), blx);
+        assert_eq!(patch(R_ARM_CALL, blx, 0x9000_021C, 0x9000_0230).unwrap(), blx);
+    }
+
+    #[test]
+    fn only_branches_take_thumb_calls() {
+        // bl, b.w and blx
+        assert!(fits(R_ARM_THM_CALL, 0xF800_F000));
+        assert!(fits(R_ARM_THM_CALL, 0xB800_F000));
+        assert!(fits(R_ARM_THM_CALL, 0xE800_F000));
+        // a blx with H set, a bne.w and a dmb
+        assert!(!fits(R_ARM_THM_CALL, 0xE801_F000));
+        assert!(!fits(R_ARM_THM_CALL, 0x8000_F040));
+        assert!(!fits(R_ARM_THM_CALL, 0x8F5B_F3BF));
+    }
+
+    #[test]
+    fn prel31_addends_get_their_sign() {
+        // an unwind table entry at 0x8100_0020 pointing back 0x20 bytes to a
+        // function, which the vitasdk gives the addend 0x8000_0000, its 31
+        // bits taken as 0x7FFF_FFE0 ahead rather than 0x20 behind
+        let mut text = vec![0; 0x40];
+        text[0x20..0x24].copy_from_slice(&0x7FFF_FFE0u32.to_le_bytes());
+        let segments = [data(0x8100_0000, text)];
+        let table = words(&[(R_ARM_PREL31 as u32) << 8, 0x8000_0000, 0x20]);
+        let mut formats = [0; 10];
+        let found = decode(&table, &segments, &mut formats).unwrap();
+        assert_eq!((found[0].symbol, found[0].addend), (Some(0), 0));
+        assert_eq!(found[0].target(0x8100_0000), 0x8100_0000);
+        // and relocating still writes the same word
+        assert_eq!(patch(R_ARM_PREL31, 0x7FFF_FFE0, 0x8100_0020, 0x8100_0000).unwrap(), 0x7FFF_FFE0);
     }
 }

@@ -15,7 +15,10 @@ fn main() {
         std::process::exit(2);
     };
     let mut files: Vec<_> = std::fs::read_dir(&dir)
-        .unwrap_or_else(|error| panic!("{dir}: {error}"))
+        .unwrap_or_else(|error| {
+            eprintln!("could not read {dir}, {error}");
+            std::process::exit(1);
+        })
         .map(|entry| entry.unwrap().path())
         .filter(|path| path.extension().is_some_and(|extension| extension == "yml"))
         .collect();
@@ -34,9 +37,10 @@ fn main() {
     }
 }
 
-/// the user libraries in one file of the database. the files are YAML, but
-/// regular enough to read by indentation: modules, their libraries, and in
-/// each a kernel flag, a nid and lists of functions and variables.
+/// adds the user libraries in one file of the database to libraries. the
+/// files are YAML, but regular enough to read by indentation: modules, their
+/// libraries, and in each a kernel flag, a NID and lists of functions and
+/// variables.
 fn read(path: &Path, libraries: &mut BTreeMap<String, Library>) {
     let text = std::fs::read_to_string(path).unwrap();
     let mut library: Option<(String, bool, u32)> = None;

@@ -80,8 +80,8 @@ impl Game {
         self.sfo.as_ref()?.title()
     }
 
-    /// the game's code: eboot.bin, then every module it has, .suprx files
-    /// in sce_module and wherever else it keeps them.
+    /// the game's code, eboot.bin and then every other module it has, the
+    /// .suprx and .prx files in sce_module and wherever else it keeps them.
     pub fn modules(&self) -> Vec<&str> {
         let eboot = self.find(EBOOT).map(String::as_str);
         let modules = self.files.iter().map(String::as_str).filter(|file| {

@@ -1,15 +1,23 @@
+//! vitarecomp, a static recompiler for PlayStation Vita games, which so far
+//! only reads them.
+//!
+//! info shows what a module is made of: its segments, its relocations and
+//! the libraries it exports and imports by NID, for one module or every
+//! module of a game's folder or .vpk.
+
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::io::Write as _;
 use std::path::Path;
 use std::process::ExitCode;
 
+use vita_module::elf::{self, PF_R, PF_W, PF_X};
 use vita_module::game::Game;
 use vita_module::relocation;
 use vita_module::sfo::Value;
 use vita_module::{nid, Container, Module, ET_SCE_EXEC, PT_LOAD, PT_SCE_RELA};
 
-/// a line of what info shows, into a string, which can't fail.
+/// a line of what info shows, into a string, which cannot fail.
 macro_rules! say {
     ($out:expr) => {
         writeln!($out).unwrap()
@@ -19,18 +27,28 @@ macro_rules! say {
     };
 }
 
-const USAGE: &str = "usage: vitarecomp info <eboot.bin, .suprx, a game's folder or .vpk> [--all]
+const USAGE: &str = "\
+usage, vitarecomp info <eboot.bin, .suprx, a game's folder or .vpk> [--all]
 
 info shows what a module is made of: its segments, its relocations and the
 libraries it exports and imports, by NID. --all lists every import rather
 than how many each library has, and every export.";
 
 fn main() -> ExitCode {
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    let all = args.iter().any(|arg| arg == "--all");
-    let paths: Vec<&String> = args.iter().filter(|arg| !arg.starts_with("--")).collect();
-    match paths.as_slice() {
-        [command, path] if command.as_str() == "info" => match info(Path::new(path), all) {
+    let mut words = Vec::new();
+    let mut all = false;
+    for arg in std::env::args().skip(1) {
+        match arg.as_str() {
+            "--all" => all = true,
+            other if other.starts_with("--") => {
+                eprintln!("unknown option {other}\n{USAGE}");
+                return ExitCode::from(2);
+            }
+            _ => words.push(arg),
+        }
+    }
+    match words.iter().map(String::as_str).collect::<Vec<_>>()[..] {
+        ["info", path] => match info(Path::new(path), all) {
             Ok(()) => ExitCode::SUCCESS,
             Err(error) => {
                 eprintln!("{path}: {error}");
@@ -52,9 +70,9 @@ fn info(path: &Path, all: bool) -> Result<(), vita_module::Error> {
         if let Some(sfo) = &game.sfo {
             for key in ["APP_VER", "CATEGORY", "CONTENT_ID", "PSP2_SYSTEM_VER", "ATTRIBUTE", "ATTRIBUTE2"] {
                 match sfo.get(key) {
-                    Some(Value::Text(text)) => say!(out, "  {key} {text}"),
+                    Some(Value::Text(text)) if !text.is_empty() => say!(out, "  {key} {text}"),
                     Some(Value::Number(number)) => say!(out, "  {key} 0x{number:X}"),
-                    None => {}
+                    _ => {}
                 }
             }
         }
@@ -73,33 +91,17 @@ fn info(path: &Path, all: bool) -> Result<(), vita_module::Error> {
     Ok(())
 }
 
-/// how many entries there are, in words.
-fn entries(count: usize) -> String {
-    if count == 1 {
-        "1 entry".to_owned()
-    } else {
-        format!("{count} entries")
-    }
-}
-
-/// how many libraries there are, in words.
-fn libraries(count: usize) -> String {
-    if count == 1 {
-        "1 library".to_owned()
-    } else {
-        format!("{count} libraries")
-    }
-}
-
 /// how many of something there are, in words.
-fn count(count: usize, what: &str) -> String {
-    if count == 1 {
-        format!("1 {what}")
+fn count(number: usize, one: &str, many: &str) -> String {
+    if number == 1 {
+        format!("1 {one}")
     } else {
-        format!("{count} {what}s")
+        format!("{number} {many}")
     }
 }
 
+/// writes what module, called name, is made of into out, every export and
+/// import when all is set.
 fn show(out: &mut String, name: &str, module: &Module, all: bool) {
     let container = match module.container {
         Container::Elf => "ELF".to_owned(),
@@ -126,12 +128,12 @@ fn show(out: &mut String, name: &str, module: &Module, all: bool) {
         let kind = match segment.kind {
             PT_LOAD => "LOAD".to_owned(),
             PT_SCE_RELA => "SCE_RELA".to_owned(),
-            vita_module::elf::PT_SCE_COMMENT => "SCE_COMMENT".to_owned(),
-            vita_module::elf::PT_SCE_VERSION => "SCE_VERSION".to_owned(),
-            vita_module::elf::PT_ARM_EXIDX => "ARM_EXIDX".to_owned(),
+            elf::PT_SCE_COMMENT => "SCE_COMMENT".to_owned(),
+            elf::PT_SCE_VERSION => "SCE_VERSION".to_owned(),
+            elf::PT_ARM_EXIDX => "ARM_EXIDX".to_owned(),
             other => format!("0x{other:08X}"),
         };
-        let flags: String = [(4, 'R'), (2, 'W'), (1, 'X')]
+        let flags: String = [(PF_R, 'R'), (PF_W, 'W'), (PF_X, 'X')]
             .iter()
             .map(|&(bit, letter)| if segment.flags & bit != 0 { letter } else { '-' })
             .collect();
@@ -162,7 +164,7 @@ fn show(out: &mut String, name: &str, module: &Module, all: bool) {
             "  unwind tables 0x{:08X}..0x{:08X}, {}",
             info.exidx.start,
             info.exidx.end,
-            entries(((info.exidx.end - info.exidx.start) / 8) as usize)
+            count(((info.exidx.end - info.exidx.start) / 8) as usize, "entry", "entries")
         );
     }
     if let Some(tls) = &info.tls {
@@ -201,7 +203,7 @@ fn show(out: &mut String, name: &str, module: &Module, all: bool) {
         }
     }
 
-    let entries_text = entries(module.relocation_formats.iter().sum());
+    let entries: usize = module.relocation_formats.iter().sum();
     let formats: Vec<String> = module
         .relocation_formats
         .iter()
@@ -209,7 +211,17 @@ fn show(out: &mut String, name: &str, module: &Module, all: bool) {
         .filter(|(_, &count)| count > 0)
         .map(|(format, count)| format!("{count} of format {format}"))
         .collect();
-    say!(out, "  {} in {} ({})", count(module.relocations.len(), "relocation"), entries_text, formats.join(", "));
+    if entries == 0 {
+        say!(out, "  no relocations");
+    } else {
+        say!(
+            out,
+            "  {} in {} ({})",
+            count(module.relocations.len(), "relocation", "relocations"),
+            count(entries, "entry", "entries"),
+            formats.join(", ")
+        );
+    }
     let mut kinds: BTreeMap<u8, usize> = BTreeMap::new();
     for relocation in &module.relocations {
         *kinds.entry(relocation.kind).or_default() += 1;
@@ -220,7 +232,12 @@ fn show(out: &mut String, name: &str, module: &Module, all: bool) {
     }
     let misplaced = module.misplaced_relocations();
     if !misplaced.is_empty() {
-        say!(out, "    {} of them don't patch what their kind patches, the first:", misplaced.len());
+        say!(
+            out,
+            "    {} of them are not on an instruction their kind patches, the first {}",
+            misplaced.len(),
+            misplaced.len().min(5)
+        );
         for relocation in misplaced.iter().take(5) {
             say!(
                 out,
@@ -238,17 +255,17 @@ fn show(out: &mut String, name: &str, module: &Module, all: bool) {
             Some(name) => format!("{name} 0x{:08X}", export.nid),
             None => "the module's own".to_owned(),
         };
-        let nid_of = if export.is_noname() { 0 } else { export.nid };
+        let library_nid = if export.is_noname() { 0 } else { export.nid };
         say!(
             out,
             "    {library}, {} and {}, attributes 0x{:04X}",
-            count(export.functions.len(), "function"),
-            count(export.variables.len(), "variable"),
+            count(export.functions.len(), "function", "functions"),
+            count(export.variables.len(), "variable", "variables"),
             export.attributes
         );
         if all || export.is_noname() {
             for &(nid, address) in export.functions.iter().chain(&export.variables) {
-                say!(out, "      0x{nid:08X} {:<40} 0x{address:08X}", nid::name(nid_of, nid).unwrap_or("?"));
+                say!(out, "      0x{nid:08X} {:<40} 0x{address:08X}", nid::name(library_nid, nid).unwrap_or("?"));
             }
         }
     }
@@ -259,17 +276,21 @@ fn show(out: &mut String, name: &str, module: &Module, all: bool) {
         .imports
         .iter()
         .map(|import| {
-            let names = |nid: u32| nid::name(import.nid, nid).is_none() as usize;
-            import.functions.iter().map(|f| names(f.nid)).sum::<usize>()
-                + import.variables.iter().map(|v| names(v.nid)).sum::<usize>()
+            let unnamed = |nid: u32| nid::name(import.nid, nid).is_none() as usize;
+            import.functions.iter().map(|function| unnamed(function.nid)).sum::<usize>()
+                + import.variables.iter().map(|variable| unnamed(variable.nid)).sum::<usize>()
         })
         .sum();
+    if module.imports.is_empty() {
+        say!(out, "  no imports");
+        return;
+    }
     say!(
         out,
         "  imports, {}, {} and {}, {unknown} of them without a known name",
-        libraries(module.imports.len()),
-        count(functions, "function"),
-        count(variables, "variable")
+        count(module.imports.len(), "library", "libraries"),
+        count(functions, "function", "functions"),
+        count(variables, "variable", "variables")
     );
     for import in &module.imports {
         let name = import.name.as_deref().or(nid::library(import.nid)).unwrap_or("?");
@@ -277,8 +298,8 @@ fn show(out: &mut String, name: &str, module: &Module, all: bool) {
             out,
             "    {name} 0x{:08X}, {} and {}, version {}, attributes 0x{:04X}",
             import.nid,
-            count(import.functions.len(), "function"),
-            count(import.variables.len(), "variable"),
+            count(import.functions.len(), "function", "functions"),
+            count(import.variables.len(), "variable", "variables"),
             import.version,
             import.attributes
         );
@@ -288,7 +309,7 @@ fn show(out: &mut String, name: &str, module: &Module, all: bool) {
         for function in &import.functions {
             let taken = match function.references.len() {
                 0 => String::new(),
-                times => format!(", its address taken {}", count(times, "time")),
+                times => format!(", its address taken {}", count(times, "time", "times")),
             };
             say!(
                 out,
@@ -304,7 +325,7 @@ fn show(out: &mut String, name: &str, module: &Module, all: bool) {
                 "      0x{:08X} {:<40} variable, {}",
                 variable.nid,
                 nid::name(import.nid, variable.nid).unwrap_or("?"),
-                count(variable.references.len(), "reference")
+                count(variable.references.len(), "reference", "references")
             );
         }
     }

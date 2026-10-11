@@ -1,7 +1,8 @@
 //! reading the PlayStation Vita's executables and modules, a game's eboot.bin
 //! and its .suprx files, whether they come as a SELF or as a plain ELF:
 //! their segments, what they export and import by NID, and the relocations
-//! that let the system load them anywhere.
+//! that let the system load them anywhere; and the games they come in, a
+//! folder or a .vpk with its param.sfo.
 
 pub mod elf;
 pub mod game;
@@ -39,14 +40,33 @@ pub enum Error {
     #[error("{0} runs past the end of the file")]
     Truncated(&'static str),
 
-    #[error("segment {0} can't be decompressed")]
+    #[error("{0} points outside the module")]
+    Outside(&'static str),
+
+    #[error("segment {0} cannot be decompressed")]
     Compression(usize),
 
-    #[error("malformed {0}")]
+    #[error("segment {0} is 0x{1:X} bytes in the SELF, its program header says 0x{2:X}")]
+    SegmentSize(usize, usize, u32),
+
+    #[error("{0} is malformed")]
     Malformed(&'static str),
+
+    #[error("module info of version {0}, not the 6 every SDK from 0.940 on writes")]
+    InfoVersion(u8),
 
     #[error("relocation entry of unknown format {0}")]
     UnknownRelocation(u32),
+
+    #[error("no base given for segment {0}")]
+    NoBase(u8),
+
+    #[error("a fixed module cannot move from where it was linked")]
+    Fixed,
+
+    /// a .vpk this cannot read, said in a whole sentence.
+    #[error("{0}")]
+    Vpk(&'static str),
 
     #[error("{0} is not in the game")]
     NotFound(String),
@@ -63,7 +83,9 @@ pub enum Container {
 }
 
 impl Container {
-    /// whether a SELF was made by the vitasdk rather than by Sony's tools.
+    /// whether a SELF carries an authority id vita-make-fself gives when it
+    /// is not told one, 0x2F00000000000001, or ...02 and ...03 for -s and
+    /// -ss. one made with -a looks like Sony's.
     pub fn is_homebrew(&self) -> bool {
         matches!(self, Container::SelfFile { authority, .. } if authority & !3 == 0x2F00_0000_0000_0000)
     }
@@ -73,7 +95,8 @@ impl Container {
 pub struct Segment {
     pub kind: u32,
     pub flags: u32,
-    /// where the module was linked to have it, which the system may move.
+    /// the address the segment was linked at, which a relocatable module
+    /// need not be loaded at.
     pub address: u32,
     pub memory_size: u32,
     pub align: u32,
@@ -132,8 +155,11 @@ impl Module {
             return Err(Error::NotVita(header.kind, header.machine));
         }
         let info = Info::read(&segments, header.entry)?;
+        // the vitasdk's own modules: its SELFs, and its ELFs, which have no
+        // fingerprint until vita-make-fself puts one in
+        let vitasdk = container.is_homebrew() || (container == Container::Elf && info.fingerprint == 0);
         let exports = info::exports(&segments, &info)?;
-        let imports = info::imports(&segments, &info)?;
+        let imports = info::imports(&segments, &info, vitasdk)?;
         let mut relocation_formats = [0; 10];
         let mut relocations = Vec::new();
         for segment in segments.iter().filter(|segment| segment.kind == PT_SCE_RELA) {
@@ -190,9 +216,9 @@ impl Module {
         ProcessParam::read(self, self.noname()?.variable(nid::PROCESS_PARAM)?)
     }
 
-    /// the relocations whose place doesn't hold the instruction they patch,
-    /// a movw for a movw, a branch for a call. there are none when the
-    /// relocations are read right.
+    /// the relocations whose place does not hold the instruction their kind
+    /// patches, a movw under MOVW_ABS_NC, a bl or blx under THM_CALL. there
+    /// are none when the relocations are read right.
     pub fn misplaced_relocations(&self) -> Vec<&Relocation> {
         self.relocations
             .iter()
@@ -207,32 +233,38 @@ impl Module {
             .collect()
     }
 
-    /// the loadable segments as they are once each is at its base, as long
-    /// as their memory size, every relocation applied. a segment that isn't
-    /// loaded gets nothing, its base doesn't matter.
+    /// every segment, by index, as it is once each loadable one is at its
+    /// base: as long as its memory size, with every relocation applied. a
+    /// segment that is not loaded comes back empty. bases holds a base for
+    /// each segment by index, of which only those relocations name matter,
+    /// and a fixed module has to keep the addresses it was linked at.
     pub fn relocated(&self, bases: &[u32]) -> Result<Vec<Vec<u8>>, Error> {
+        if self.is_fixed()
+            && self.segments.iter().zip(bases).any(|(segment, &base)| segment.is_load() && base != segment.address)
+        {
+            return Err(Error::Fixed);
+        }
         let mut images: Vec<Vec<u8>> = self
             .segments
             .iter()
             .map(|segment| {
-                let mut image = segment.bytes.clone();
-                if segment.is_load() {
-                    image.resize(segment.size() as usize, 0);
+                if !segment.is_load() {
+                    return Vec::new();
                 }
+                let mut image = segment.bytes.clone();
+                image.resize(segment.size() as usize, 0);
                 image
             })
             .collect();
-        let base = |segment: u8| {
-            bases.get(segment as usize).copied().ok_or(Error::Malformed("relocation to a segment without a base"))
-        };
+        let base = |segment: u8| bases.get(segment as usize).copied().ok_or(Error::NoBase(segment));
         for relocation in &self.relocations {
             let place = base(relocation.segment)?.wrapping_add(relocation.offset);
             let target = relocation.target(relocation.symbol.map_or(Ok(0), base)?);
             let image = &mut images[relocation.segment as usize];
             let at = relocation.offset as usize;
-            let word = u32_at(image, at).ok_or(Error::Malformed("relocation past its segment"))?;
+            let word = u32_at(image, at).ok_or(Error::Malformed("a relocation past its segment"))?;
             let patched = relocation::patch(relocation.kind, word, place, target)
-                .ok_or(Error::Malformed("relocation of a kind the Vita doesn't have"))?;
+                .ok_or(Error::Malformed("a relocation of a kind the Vita does not have"))?;
             image[at..at + 4].copy_from_slice(&patched.to_le_bytes());
         }
         Ok(images)
@@ -258,18 +290,19 @@ fn unpack_elf(bytes: &[u8]) -> Result<(Container, elf::Header, Vec<Segment>), Er
             .ok_or(Error::Truncated("the program headers"))?;
     let segments = program_headers
         .into_iter()
-        .map(|ph| {
-            let start = ph.offset as usize;
-            let bytes = bytes.get(start..start + ph.file_size as usize).ok_or(Error::Truncated("a segment"))?.to_vec();
-            Ok(segment(&ph, bytes))
+        .map(|program_header| {
+            let start = program_header.offset as usize;
+            let end = start + program_header.file_size as usize;
+            let bytes = bytes.get(start..end).ok_or(Error::Truncated("a segment"))?.to_vec();
+            Ok(segment(&program_header, bytes))
         })
         .collect::<Result<_, Error>>()?;
     Ok((Container::Elf, header, segments))
 }
 
-/// the parts of a SELF's header that lead to the ELF in it: a copy of the
-/// ELF header and its program headers, and where each segment's bytes
-/// are, possibly compressed.
+/// the ELF a SELF holds: its header and program headers from the copies the
+/// SELF keeps, and each segment's bytes from where the segment info puts
+/// them, inflated when they are compressed.
 fn unpack_self(bytes: &[u8]) -> Result<(Container, elf::Header, Vec<Segment>), Error> {
     let field = |at: usize| u64_at(bytes, at).map(|value| value as usize).ok_or(Error::Truncated("the SELF header"));
     let (app_info, elf_at, program_headers_at, segment_info) = (field(0x38)?, field(0x40)?, field(0x48)?, field(0x58)?);
@@ -280,7 +313,7 @@ fn unpack_self(bytes: &[u8]) -> Result<(Container, elf::Header, Vec<Segment>), E
     let authority = u64_at(bytes, app_info).ok_or(Error::Truncated("the app info"))?;
     let mut compressed = false;
     let mut segments = Vec::with_capacity(count);
-    for (index, ph) in program_headers.iter().enumerate() {
+    for (index, program_header) in program_headers.iter().enumerate() {
         let info = segment_info + index * 0x20;
         let (Some(offset), Some(length), Some(compression), Some(encryption)) =
             (u64_at(bytes, info), u64_at(bytes, info + 8), u64_at(bytes, info + 0x10), u64_at(bytes, info + 0x18))
@@ -292,22 +325,34 @@ fn unpack_self(bytes: &[u8]) -> Result<(Container, elf::Header, Vec<Segment>), E
             return Err(Error::Encrypted);
         }
         let stored = bytes.get(offset as usize..(offset + length) as usize).ok_or(Error::Truncated("a segment"))?;
-        // even a segment with no bytes in the file can come as a
-        // compressed empty stream
-        let data = if compression == 2 && length != 0 {
+        // a segment the ELF has no bytes of can still be stored as a
+        // compressed empty stream, eight bytes of zlib, so whatever is stored
+        // is inflated
+        let inflate = compression == 2 && length != 0;
+        let mut data = if inflate {
             compressed = true;
             miniz_oxide::inflate::decompress_to_vec_zlib(stored).map_err(|_| Error::Compression(index))?
         } else {
             stored.to_vec()
         };
-        if data.len() != ph.file_size as usize {
-            return Err(Error::Compression(index));
+        // vita-make-fself pads what it stores to a whole word
+        let size = program_header.file_size as usize;
+        if data.len() < size || (inflate && data.len() != size) {
+            return Err(Error::SegmentSize(index, data.len(), program_header.file_size));
         }
-        segments.push(segment(ph, data));
+        data.truncate(size);
+        segments.push(segment(program_header, data));
     }
     Ok((Container::SelfFile { authority, compressed }, header, segments))
 }
 
-fn segment(ph: &elf::ProgramHeader, bytes: Vec<u8>) -> Segment {
-    Segment { kind: ph.kind, flags: ph.flags, address: ph.address, memory_size: ph.memory_size, align: ph.align, bytes }
+fn segment(header: &elf::ProgramHeader, bytes: Vec<u8>) -> Segment {
+    Segment {
+        kind: header.kind,
+        flags: header.flags,
+        address: header.address,
+        memory_size: header.memory_size,
+        align: header.align,
+        bytes,
+    }
 }

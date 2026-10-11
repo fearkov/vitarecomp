@@ -73,7 +73,7 @@ pub fn library(nid: u32) -> Option<&'static str> {
 /// zero for the one modules export without a name.
 pub fn name(library: u32, nid: u32) -> Option<&'static str> {
     if library == 0 {
-        return NONAME.iter().find(|&&(at, _)| at == nid).map(|&(_, name)| name);
+        return NONAME.iter().find(|&&(known, _)| known == nid).map(|&(_, name)| name);
     }
     names().entries.get(&(library, nid)).copied()
 }

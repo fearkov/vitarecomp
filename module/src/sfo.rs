@@ -48,7 +48,7 @@ impl Sfo {
     }
 
     pub fn get(&self, key: &str) -> Option<&Value> {
-        self.entries.iter().find(|(at, _)| at == key).map(|(_, value)| value)
+        self.entries.iter().find(|(name, _)| name == key).map(|(_, value)| value)
     }
 
     pub fn text(&self, key: &str) -> Option<&str> {
