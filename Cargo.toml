@@ -1,0 +1,20 @@
+[package]
+name = "vitarecomp"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.95"
+license = "MIT"
+description = "Static recompilation toolkit for the PlayStation Vita"
+
+[[bin]]
+name = "vitarecomp"
+path = "src/main.rs"
+
+[workspace]
+members = ["module"]
+
+[dependencies]
+vita-module = { path = "module" }
+
+[profile.release]
+debug = 1

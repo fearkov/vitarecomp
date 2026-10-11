@@ -1,0 +1,19 @@
+[package]
+name = "vita-module"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.95"
+license = "MIT"
+description = "Reading the PlayStation Vita's executables and modules: SELF and ELF files, their imports, exports and relocations"
+
+[features]
+# builders of modules, for the tests of the crates that read them
+testing = []
+
+[dependencies]
+miniz_oxide = "0.8"
+thiserror = "2"
+
+[dev-dependencies]
+# the builders in testing, for the tests in tests/
+vita-module = { path = ".", features = ["testing"] }
